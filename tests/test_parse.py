@@ -2,11 +2,9 @@
 """rosview 解析 / 换行 / 会话发现单元测试。运行: python3 tests/test_parse.py"""
 import os
 import sys
-from importlib.machinery import SourceFileLoader
 
-sys.path.insert(0, os.path.dirname(__file__))
-rv = SourceFileLoader("rosview", os.path.join(
-    os.path.dirname(__file__), "..", "rosview")).load_module()
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import rosview as rv
 
 FIXTURE = os.path.join(os.path.dirname(__file__),
                        "fixtures", "2026-09-10T12-00-00-demo-1234",

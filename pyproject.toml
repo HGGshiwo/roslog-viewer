@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rosview"
+version = "1.0.0"
+description = "htop/vim 风格的 ROS 日志终端查看器 (TUI log viewer for ROS)"
+readme = "README.md"
+requires-python = ">=3.6"
+license = { text = "MIT" }
+keywords = ["ros", "log", "tui", "curses", "terminal"]
+classifiers = [
+    "Environment :: Console",
+    "Topic :: System :: Logging",
+    "Topic :: Utilities",
+]
+
+[project.scripts]
+rosview = "rosview:main"
+
+[tool.setuptools]
+packages = ["rosview"]

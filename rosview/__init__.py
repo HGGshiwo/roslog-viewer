@@ -729,8 +729,6 @@ class App(object):
         if self.input is not None:
             self.handle_input(k)
             return
-        if k == -1:
-            return
         if k in (ord('q'), ord('Q')):
             raise Quit()
         if k == ord('?'):

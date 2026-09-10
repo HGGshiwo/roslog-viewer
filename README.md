@@ -17,11 +17,25 @@
 
 ## 安装(一键)
 
+把仓库推送到 GitHub 后,一条命令安装(把 `YOUR_GITHUB_USER` 换成你的用户名):
+
 ```bash
-./install.sh
+pip install git+https://github.com/YOUR_GITHUB_USER/roslog-viewer.git
 ```
 
-脚本会把 `rosview` 安装到 `~/.local/bin`(可用 `ROSVIEW_PREFIX=/usr/local/bin ./install.sh` 换目录),并检测 `python3` 和 `PATH`。
+安装后自动获得 `rosview` 命令(pip 会装到 `~/.local/bin`,请确保其在 `PATH` 中)。升级:
+
+```bash
+pip install --user --upgrade git+https://github.com/YOUR_GITHUB_USER/roslog-viewer.git
+```
+
+本地开发安装:
+
+```bash
+pip install --user .
+```
+
+> 说明: rosview 零第三方依赖,纯标准库实现;只要 `python3 >= 3.6` 即可,ROS 环境无需额外配置。
 
 ## 使用
 
@@ -31,6 +45,8 @@ rosview -s                 # 先选择历史会话
 rosview <日志文件或目录>     # 任意 rosout.log 或 run 目录
 rosview -n                 # 只读 rosout.log,不合并各节点 *.log
 ```
+
+也可以不装直接跑源码: `PYTHONPATH=. python3 -m rosview`
 
 ## 按键
 
@@ -61,8 +77,31 @@ rosview -n                 # 只读 rosout.log,不合并各节点 *.log
 ## 测试
 
 ```bash
-python3 -m py_compile rosview          # 语法
-python3 tests/test_parse.py            # 解析 / 换行 / 发现逻辑
+python3 tests/test_parse.py    # 解析 / 换行 / 去重 / 会话发现
+bash tests/smoke_tmux.sh       # tmux 交互冒烟(需要 tmux)
 ```
 
-终端交互冒烟测试需要 `tmux`,见 `tests/smoke_tmux.sh`。
+## 推送到 GitHub
+
+```bash
+cd ~/roslog-viewer
+git init && git add . && git commit -m "rosview: ROS log TUI viewer"
+# 在 GitHub 上新建空仓库 roslog-viewer 后:
+git remote add origin git@github.com:YOUR_GITHUB_USER/roslog-viewer.git
+git push -u origin master
+```
+
+之后任何人都可以 `pip install git+https://github.com/YOUR_GITHUB_USER/roslog-viewer.git` 一键安装。
+
+## 项目结构
+
+```
+rosview/
+  __init__.py    # 全部实现(单文件,零依赖)
+  __main__.py    # 支持 python -m rosview
+pyproject.toml   # pip 打包配置(console_scripts 入口点)
+tests/
+  test_parse.py  # 解析 / 换行 / 去重 / 会话发现
+  smoke_tmux.sh  # tmux 交互冒烟测试
+  fixtures/      # ROS1 日志样例
+```

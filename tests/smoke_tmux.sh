@@ -6,14 +6,13 @@ S=rosview_smoke
 cleanup() { tmux kill-session -t $S 2>/dev/null || true; }
 trap cleanup EXIT
 cleanup
-tmux new-session -d -x 110 -y 28 -s $S "cd '$DIR' && ./rosview ~/.ros/log/latest -n"
+tmux new-session -d -x 110 -y 28 -s $S "cd '$DIR' && PYTHONPATH='$DIR' python3 -m rosview ~/.ros/log/latest -n"
 sleep 1.2
 
 cap() { tmux capture-pane -t $S -p; }
 
 # 节点列表渲染
 cap | grep -q "节点" && cap | grep -q "ERR"
-tmux send-keys -t $S Down
 sleep 0.3
 # 进入日志视图并到底部
 tmux send-keys -t $S Enter; sleep 0.6
