@@ -20,9 +20,9 @@ import sys
 import time
 import unicodedata
 
-VERSION = "1.0.0"
+VERSION = "1.0.1"
 MAX_LINES_PER_FILE = 200_000      # keep last N lines per file
-MAX_VIS_LINES = 150_000           # cap built visual lines in log view
+MAX_VIS_LINES = 400_000           # cap built visual lines in log view
 GETCH_TIMEOUT_MS = 400            # poll interval for follow mode
 
 SEV_DEBUG, SEV_INFO, SEV_WARN, SEV_ERROR, SEV_FATAL = 1, 2, 3, 4, 5
@@ -67,6 +67,8 @@ NODEFILE_RE = re.compile(
 
 def dwidth(s):
     """Display width of a string (east-asian aware)."""
+    if hasattr(s, "isascii") and s.isascii():
+        return len(s)
     w = 0
     for ch in s:
         w += 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
@@ -77,6 +79,8 @@ def clip_to_width(s, width):
     """Return the longest prefix of s fitting in `width` display columns."""
     if width <= 0:
         return ""
+    if len(s) <= width and (not s or s.isascii()):
+        return s
     out, w = [], 0
     for ch in s:
         cw = 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
@@ -133,23 +137,25 @@ def norm_node(name):
 # ---------------------------------------------------------------- model
 
 class Entry(object):
-    __slots__ = ("ts", "sev", "node", "msg", "seq")
+    __slots__ = ("ts", "sev", "node", "msg", "seq", "src")
 
-    def __init__(self, ts, sev, node, msg, seq):
+    def __init__(self, ts, sev, node, msg, seq, src=0):
         self.ts = ts
         self.sev = sev
         self.node = node
         self.msg = msg
         self.seq = seq
+        self.src = src               # loader id, for cross-file dedupe
 
 
 class FileLoader(object):
     """Incremental reader for one log file; keeps parse state for follow."""
 
-    def __init__(self, path, default_node, counter):
+    def __init__(self, path, default_node, counter, src=0):
         self.path = path
         self.default_node = default_node
         self.counter = counter          # shared itertools-like [n] box
+        self.src = src
         self.f = open(path, "r", errors="replace")
         self.size = 0
         self.last = None                # last Entry, for continuation lines
@@ -157,7 +163,7 @@ class FileLoader(object):
         self.truncated = False
 
     def _new_entry(self, ts, sev, node, msg):
-        e = Entry(ts, sev, node, msg, self.counter[0])
+        e = Entry(ts, sev, node, msg, self.counter[0], self.src)
         self.counter[0] += 1
         self.entries.append(e)
         self.last = e
@@ -260,7 +266,8 @@ class Session(object):
         self.nodes = {}
         self.truncated = False
         counter = [0]
-        ld = FileLoader(self.rosout_path, UNKNOWN_NODE, counter)
+        src = 0
+        ld = FileLoader(self.rosout_path, UNKNOWN_NODE, counter, src)
         ld.read_available()
         self.loaders.append(ld)
         if self.include_node_files:
@@ -271,7 +278,8 @@ class Session(object):
                 stem = base[:-4] if base.endswith(".log") else base
                 stem = re.sub(r"(-\d+)+$", "", stem) or stem
                 try:
-                    fl = FileLoader(path, norm_node(stem), counter)
+                    src += 1
+                    fl = FileLoader(path, norm_node(stem), counter, src)
                 except OSError:
                     continue
                 fl.read_available()
@@ -288,14 +296,17 @@ class Session(object):
         ents.sort(key=lambda e: (e.ts if e.ts is not None else float("inf"),
                                  e.seq))
         # rosout.log already aggregates all nodes; the per-node *.log files
-        # largely duplicate it — drop (node, sev, msg) repeats
-        seen = set()
+        # largely duplicate it. Dedupe identical (node,sev,msg) only ACROSS
+        # files — repeats inside one file are distinct events (e.g. periodic
+        # diagnostics) and must be kept.
+        seen_by_key = {}
         uniq = []
         for e in ents:
             key = (e.node, e.sev, e.msg)
-            if key in seen:
-                continue
-            seen.add(key)
+            srcs = seen_by_key.setdefault(key, set())
+            if srcs and e.src not in srcs:
+                continue               # cross-file duplicate
+            srcs.add(e.src)
             uniq.append(e)
         self.entries = uniq
         self.nodes = {}
@@ -390,6 +401,9 @@ def wrap_text(s, width):
     """Word wrap; hard-breaks tokens longer than width."""
     if width <= 0:
         return [s]
+    if len(s) <= width and s.isascii() and " " not in s.strip(" "):
+        # fast path: short single token, fits on one line
+        return [s] if s else [""]
     lines, cur, curw = [], "", 0
     for word in s.split(" "):
         ww = dwidth(word)
@@ -419,9 +433,22 @@ def wrap_text(s, width):
     return lines
 
 
-def entry_visual_lines(e, width, wrap_on):
-    """Composed display lines for one entry: 'HH:MM:SS LEVEL  msg'."""
-    prefix = "%s %-5s " % (fmt_ts(e.ts), SEV_NAMES.get(e.sev, "-"))
+NODE_COL = 24                 # node-name column width in the (all) log view
+
+
+def log_prefix(e, with_node):
+    p = "%s %-5s " % (fmt_ts(e.ts), SEV_NAMES.get(e.sev, "-"))
+    if with_node:
+        n = clip_to_width(e.node, NODE_COL)
+        p += n + " " * (NODE_COL - dwidth(n)) + " "
+    return p
+
+
+def entry_visual_lines(e, width, wrap_on, with_node=False):
+    """Composed display lines for one entry: 'HH:MM:SS LEVEL  msg'.
+
+    With with_node, a fixed-width node column is inserted after the level."""
+    prefix = log_prefix(e, with_node)
     avail = width - len(prefix)
     if avail < 4:
         avail = 4
@@ -546,8 +573,10 @@ class App(object):
         self.needle = ""
         self.matches = []            # visual-line indexes
         self.match_i = -1
-        self.vis = []                # [(text, sev, entry)]
+        self.vis = []                # [(text, sev, entry, prefix_len)]
         self.vis_dirty = True
+        self.vis_cache = {}          # (seq, w, wrap, with_node) -> [(line, plen)]
+        self.vis_truncated = False
 
         if args.path:
             self.session = Session(resolve_rosout(args.path),
@@ -640,15 +669,50 @@ class App(object):
     def rebuild_vis(self):
         h, w = self.stdscr.getmaxyx()
         ents = self.log_entries()
+        with_node = (self.l_node == ALL_NODE)
+        cache = self.vis_cache
         vis = []
+        dropped_oldest = False
         for e in ents:
             if e.sev in self.hidden:
                 continue
-            for ln in entry_visual_lines(e, w, self.wrap):
-                vis.append((ln, e.sev, e))
+            key = (e.seq, w, self.wrap, with_node)
+            lines = cache.get(key)
+            if lines is None:
+                plen = len(log_prefix(e, with_node))
+                lines = [(ln, plen)
+                         for ln in entry_visual_lines(e, w, self.wrap,
+                                                      with_node)]
+                if len(cache) > 120_000:
+                    cache.clear()
+                cache[key] = lines
+            vis.extend((ln, e.sev, e, p) for ln, p in lines)
             if len(vis) > MAX_VIS_LINES:
+                # keep the NEWEST entries: drop what we just built past cap
                 del vis[MAX_VIS_LINES:]
+                dropped_oldest = True
                 break
+        # when the full view doesn't fit, keep only the last MAX_VIS_LINES
+        if dropped_oldest and len(ents) > len(vis):
+            vis = []
+            for e in reversed(ents):
+                if e.sev in self.hidden:
+                    continue
+                key = (e.seq, w, self.wrap, with_node)
+                lines = cache.get(key)
+                if lines is None:
+                    plen = len(log_prefix(e, with_node))
+                    lines = [(ln, plen)
+                             for ln in entry_visual_lines(e, w, self.wrap,
+                                                          with_node)]
+                    if len(cache) > 120_000:
+                        cache.clear()
+                    cache[key] = lines
+                vis.extend((ln, e.sev, e, p) for ln, p in lines)
+                if len(vis) >= MAX_VIS_LINES:
+                    break
+            vis.reverse()
+        self.vis_truncated = dropped_oldest and True or False
         self.vis = vis
         self.vis_dirty = False
         self.clamp_scroll()
@@ -672,7 +736,7 @@ class App(object):
         if not self.needle:
             return
         nd = self.needle.casefold()
-        for i, (text, _, _) in enumerate(self.vis):
+        for i, (text, _, _, _) in enumerate(self.vis):
             if nd in text.casefold():
                 self.matches.append(i)
         if self.matches:
@@ -1050,11 +1114,11 @@ class App(object):
             idx = self.l_scroll + row
             if idx >= len(self.vis):
                 break
-            text, sev, _e = self.vis[idx]
+            text, sev, _e, plen = self.vis[idx]
             y = 1 + row
             self.addstr(y, 0, text, th.sev(sev))
-            if len(text) > 15:
-                self.addstr(y, 0, text[:15], th.dim)
+            if len(text) > plen:
+                self.addstr(y, 0, text[:plen], th.dim)
             self.add_spans(y, text, self.needle, th.hi)
         st = " "
         if self.hidden:
@@ -1069,8 +1133,8 @@ class App(object):
                 st += " │ /%s (无匹配)" % self.needle
         if self.follow:
             st += " │ ●跟随"
-        if s.truncated:
-            st += " │ (已截断)"
+        if s.truncated or self.vis_truncated:
+            st += " │ (已截断,仅显示最新部分)"
         self.addstr(h - 2, 0, clip_to_width(st, w), th.status)
         self.draw_bottom_bar(
             h, w, " ↑↓ j/k 滚动  g/G 首尾  PgUp/PgDn 翻页  / 搜索 n/N  "

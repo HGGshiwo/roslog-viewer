@@ -52,6 +52,17 @@ lines = open(s.rosout_path).readlines()
 open(s.rosout_path, "w").writelines(
     ln for ln in lines if "appended line" not in ln)
 
+# same-file repeats are distinct events — must NOT be deduped (v1.0.1 fix)
+rep = os.path.join(os.path.dirname(__file__), "fixtures", "repeat",
+                   "rosout.log")
+r = rv.Session(rep, include_node_files=False)
+assert len(r.entries) == 6, len(r.entries)      # 5 identical + 1 other
+diag = [e for e in r.entries if "Diag" in e.msg]
+assert len(diag) == 5, len(diag)
+# cross-file dedupe (rosout vs node file) still collapses real duplicates
+xf = rv.Session(FIXTURE)
+assert dict(xf.node_names()).get(rv.ALL_NODE) == 12
+
 # wrapping
 E = lambda msg, sev=rv.SEV_INFO: rv.Entry(1757486400, sev, "t", msg, 0)
 lines = rv.entry_visual_lines(E("a " * 30), 40, True)
