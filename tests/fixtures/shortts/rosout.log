@@ -1,0 +1,5 @@
+1789027047.438234004 INFO /mavros [mavros.cpp:85(MavRos)] [topics: /rosout, /diagnostics] FCU URL: /dev/ttyS5:115200
+4519442.389637695 ERROR /camera_node_2632_4519428265 [node_usb_cam.py:88(camera_node)] [topics: /camera/color/image_raw, /rosout]
+图像转换发布失败：libp11-kit.so.0: undefined symbol: ffi_type_pointer
+1789027050.000000000 INFO /other: after clock jump
+pos=[0.000, 0.000] | dev=DOG-R-002

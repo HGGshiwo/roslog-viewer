@@ -20,7 +20,7 @@ import sys
 import time
 import unicodedata
 
-VERSION = "1.0.1"
+VERSION = "1.0.2"
 MAX_LINES_PER_FILE = 200_000      # keep last N lines per file
 MAX_VIS_LINES = 400_000           # cap built visual lines in log view
 GETCH_TIMEOUT_MS = 400            # poll interval for follow mode
@@ -44,12 +44,17 @@ ROSOUT_RE = re.compile(
     r'(?:\s*\[(?P<node>[^\]]+)\])?\s*:?\s?(?P<msg>.*)$')
 # ROS1 rosout mono format (rosout_agg written file):
 #   1789018982.235271692 INFO /node [file:line(func)] [topics: ...] msg
+# The integer part may be short (7 digits) when the device clock is not
+# synced, so accept 1-13 digits but require a level or /node to follow.
 MONO_RE = re.compile(
-    r'^\s*(?P<ts>\d{9,13}\.\d{1,9})\s+'
+    r'^\s*(?P<ts>\d{1,13}\.\d{1,9})\s+'
     r'(?:(?P<sev>DEBUG|INFO|WARN|WARNING|ERROR|ERR|FATAL|FTL)\s+)?'
     r'(?P<node>/[^\s\[]+)?\s*'
-    r'(?P<msg>\[[^\n]*|\S.*)$')
+    r'(?P<msg>(?:\[[^\n]*)|\S.*)$')
 MONO_TOPICS_RE = re.compile(r'\s*\[topics:[^\]]*\]')
+# "<ts>  Node Startup" — rosout restarts mark run boundaries
+MONO_STARTUP_RE = re.compile(
+    r'^\s*(?P<ts>\d{1,13}\.\d{1,9})\s+Node Startup\s*$')
 #  [/node] [INFO] [1234.5]: msg
 NODE_FIRST_RE = re.compile(
     r'^\s*\[(?P<node>[^\]\s][^\]]*)\]\s*'
@@ -178,10 +183,15 @@ class FileLoader(object):
                             SEV_BY_NAME.get(m.group("sev").upper()), node,
                             m.group("msg"))
             return
-        m = MONO_RE.match(line)
+        m = MONO_STARTUP_RE.match(line)
         if m:
-            node = norm_node(m.group("node")) if m.group("node") \
-                else self.default_node
+            self._new_entry(float(m.group("ts")), None, UNKNOWN_NODE,
+                            "Node Startup")
+            return
+        m = MONO_RE.match(line)
+        if m and (m.group("sev") or m.group("node")):
+            node = norm_node(m.group("node").rstrip(":")) \
+                if m.group("node") else self.default_node
             msg = MONO_TOPICS_RE.sub("", m.group("msg"))
             self._new_entry(float(m.group("ts")),
                             SEV_BY_NAME.get(m.group("sev").upper(),
