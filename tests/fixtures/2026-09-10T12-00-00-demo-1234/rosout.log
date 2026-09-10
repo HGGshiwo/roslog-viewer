@@ -1,0 +1,15 @@
+[INFO] [WallTime: 1757486400.100000] [/talker]: hello world 1
+[INFO] [WallTime: 1757486400.250000] [/listener]: I heard [hello world 1]
+[WARN] [WallTime: 1757486400.500000] [/talker]: publishing slower than expected
+[ERROR] [WallTime: 1757486400.700000] [/driver]: Failed to open device /dev/ttyUSB0
+[DEBUG] [WallTime: 1757486400.800000] [/driver]: internal state seq=42
+[FATAL] [WallTime: 1757486400.900000] [/driver]: emergency stop triggered
+[INFO] [WallTime: 1757486401.000000] [/move_base]: goal received (x=1.0, y=2.0)
+[/planner] [INFO] [1757486401.100000]: plan computed, 120 waypoints
+[INFO] [WallTime: 1757486401.200000] [/talker]: 这是一条很长的中文日志消息,用来测试自动换行功能是否正常工作,消息应当被折行到下一行显示
+[ERROR] [WallTime: 1757486401.300000] [/driver]: retry 1 of 3
+	Exception traceback:
+	  File "serial_node.py", line 55, in <module>
+	    ser = serial.Serial(port, baud)
+	serial.SerialException: could not open port /dev/ttyUSB0: Permission denied
+[INFO] [WallTime: 1757486401.400000] [/listener]: I heard [hello world 2]

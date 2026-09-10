@@ -1,0 +1,2 @@
+[rospy.client][INFO] 2026-09-10 12:00:00,100: hello world 1
+[rospy.client][WARN] 2026-09-10 12:00:00,500: publishing slower than expected
