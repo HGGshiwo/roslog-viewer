@@ -17,16 +17,16 @@
 
 ## 安装(一键)
 
-把仓库推送到 GitHub 后,一条命令安装(把 `YOUR_GITHUB_USER` 换成你的用户名):
+把仓库推送到 GitHub 后,一条命令安装:
 
 ```bash
-pip install git+https://github.com/YOUR_GITHUB_USER/roslog-viewer.git
+pip install git+https://github.com/HGGshiwo/roslog-viewer.git
 ```
 
 安装后自动获得 `rosview` 命令(pip 会装到 `~/.local/bin`,请确保其在 `PATH` 中)。升级:
 
 ```bash
-pip install --user --upgrade git+https://github.com/YOUR_GITHUB_USER/roslog-viewer.git
+pip install --user --upgrade git+https://github.com/HGGshiwo/roslog-viewer.git
 ```
 
 本地开发安装:
@@ -87,11 +87,11 @@ bash tests/smoke_tmux.sh       # tmux 交互冒烟(需要 tmux)
 cd ~/roslog-viewer
 git init && git add . && git commit -m "rosview: ROS log TUI viewer"
 # 在 GitHub 上新建空仓库 roslog-viewer 后:
-git remote add origin git@github.com:YOUR_GITHUB_USER/roslog-viewer.git
+git remote add origin git@github.com:HGGshiwo/roslog-viewer.git
 git push -u origin master
 ```
 
-之后任何人都可以 `pip install git+https://github.com/YOUR_GITHUB_USER/roslog-viewer.git` 一键安装。
+之后任何人都可以 `pip install git+https://github.com/HGGshiwo/roslog-viewer.git` 一键安装。
 
 ## 项目结构
 
