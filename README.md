@@ -4,6 +4,11 @@
 
 ![keys](https://img.shields.io/badge/keys-vim%20%2B%20htop%20style-blue)
 
+<img width="2475" height="1217" alt="e7eb10cc-32d2-405e-8206-d7ef072452ec" src="https://github.com/user-attachments/assets/3767a9e8-5e0c-4ec7-bb4a-1a27ad7eb608" />
+
+
+演示视频：[https://www.bilibili.com/video/BV1b8YL6yEmv/](https://www.bilibili.com/video/BV1b8YL6yEmv/)
+
 ## 功能
 
 - **节点选择**:自动解析 `rosout.log`(及各节点 `*.log`,自动去重),按节点分组统计日志条数 / ERROR / WARN,方向键选择
