@@ -11,6 +11,7 @@ Views:
 Keys are vim-like (j/k/g/G/Ctrl+d/u) plus arrow keys, PgUp/PgDn.
 """
 import argparse
+import bisect
 import curses
 import glob
 import locale
@@ -20,10 +21,12 @@ import sys
 import time
 import unicodedata
 
-VERSION = "1.0.2"
+VERSION = "1.0.3"
 MAX_LINES_PER_FILE = 200_000      # keep last N lines per file
-MAX_VIS_LINES = 400_000           # cap built visual lines in log view
 GETCH_TIMEOUT_MS = 400            # poll interval for follow mode
+LOAD_FIRST_MS = 250               # parse budget before showing the UI
+LOAD_STEP_MS = 120                # background parse budget per idle tick
+VIS_BUDGET_MS = 70                # visual-line build budget per idle tick
 
 SEV_DEBUG, SEV_INFO, SEV_WARN, SEV_ERROR, SEV_FATAL = 1, 2, 3, 4, 5
 SEV_NAMES = {SEV_DEBUG: "DEBUG", SEV_INFO: "INFO", SEV_WARN: "WARN",
@@ -154,18 +157,30 @@ class Entry(object):
 
 
 class FileLoader(object):
-    """Incremental reader for one log file; keeps parse state for follow."""
+    """Chunked incremental reader for one log file.
+
+    read_chunk() decodes at most 1MB per call so the UI can parse large
+    files in slices; `sent` tracks how many parsed entries the Session
+    has already integrated, enabling append-only updates."""
 
     def __init__(self, path, default_node, counter, src=0):
         self.path = path
         self.default_node = default_node
         self.counter = counter          # shared itertools-like [n] box
         self.src = src
-        self.f = open(path, "r", errors="replace")
+        self.f = open(path, "rb")
+        try:
+            self.file_size = os.fstat(self.f.fileno()).st_size
+        except OSError:
+            self.file_size = 0
         self.size = 0
         self.last = None                # last Entry, for continuation lines
         self.entries = []
+        self.sent = 0                   # entries handed to the Session
+        self.at_eof = False
+        self.dropped_front = False      # cap truncation since last integrate
         self.truncated = False
+        self._pending_b = b""
 
     def _new_entry(self, ts, sev, node, msg):
         e = Entry(ts, sev, node, msg, self.counter[0], self.src)
@@ -217,32 +232,38 @@ class FileLoader(object):
         elif line.strip():
             self._new_entry(None, None, self.default_node, line)
 
-    def read_available(self):
+    def read_chunk(self):
+        """Decode at most 1MB more of the file. True if it grew."""
+        if self.at_eof:
+            return False
         try:
             st = os.fstat(self.f.fileno())
         except OSError:
+            self.at_eof = True
             return False
-        changed = False
-        while st.st_size > self.size:
-            chunk = self.f.read(1 << 20)
-            if not chunk:
-                break
-            changed = True
-            self.size += len(chunk.encode("utf-8", "replace"))
-            self._feed(chunk)
-        return changed
+        if st.st_size <= self.size:
+            self.at_eof = True       # caught up; poll() re-arms this
+            return False
+        chunk = self.f.read(1 << 20)
+        if not chunk:
+            self.at_eof = True
+            return False
+        self.size += len(chunk)
+        self._feed(chunk)
+        return True
 
-    def _feed(self, chunk):
-        self._pending = getattr(self, "_pending", "")
-        data = self._pending + chunk
-        lines = data.split("\n")
-        self._pending = lines.pop()
-        for ln in lines:
-            self._line(ln)
+    def _feed(self, raw):
+        self._pending_b += raw
+        lines = self._pending_b.split(b"\n")
+        self._pending_b = lines.pop()
+        for lb in lines:
+            self._line(lb.decode("utf-8", "replace"))
         if len(self.entries) > MAX_LINES_PER_FILE:
             drop = len(self.entries) - MAX_LINES_PER_FILE
             del self.entries[:drop]
+            self.sent = max(0, self.sent - drop)
             self.truncated = True
+            self.dropped_front = True
             self.last = self.entries[-1] if self.entries else None
 
     def close(self):
@@ -253,7 +274,12 @@ class FileLoader(object):
 
 
 class Session(object):
-    """One run directory: rosout.log + per-node *.log files."""
+    """One run directory: rosout.log + per-node *.log files.
+
+    Parsing is incremental: load() opens the files and decodes a first
+    slice; step() continues within a time budget so the UI stays
+    responsive on huge logs. New entries are integrated append-only;
+    a full re-sort happens only when timestamps jump backwards."""
 
     def __init__(self, rosout_path, include_node_files=True):
         self.rosout_path = os.path.abspath(rosout_path)
@@ -261,9 +287,15 @@ class Session(object):
         self.name = os.path.basename(self.dir) or self.rosout_path
         self.include_node_files = include_node_files
         self.loaders = []
-        self.entries = []       # merged, sorted
+        self.entries = []       # merged, sorted (grows incrementally)
         self.nodes = {}         # name -> {"counts": {}, "entries": []}
         self.truncated = False
+        self.fully_loaded = False
+        self.appended = []      # entries accepted since last drain
+        self.dirty_order = False        # entries were re-sorted
+        self._key_srcs = {}
+        self._single = False    # single file: no cross-file dedupe needed
+        self._last_ts = None
         self.load()
 
     # -- loading
@@ -275,10 +307,14 @@ class Session(object):
         self.entries = []
         self.nodes = {}
         self.truncated = False
+        self.fully_loaded = False
+        self.appended = []
+        self.dirty_order = False
+        self._key_srcs = {}
+        self._last_ts = None
         counter = [0]
         src = 0
         ld = FileLoader(self.rosout_path, UNKNOWN_NODE, counter, src)
-        ld.read_available()
         self.loaders.append(ld)
         if self.include_node_files:
             for path in sorted(glob.glob(os.path.join(self.dir, "*.log"))):
@@ -292,47 +328,118 @@ class Session(object):
                     fl = FileLoader(path, norm_node(stem), counter, src)
                 except OSError:
                     continue
-                fl.read_available()
                 self.loaders.append(fl)
-        self._merge()
+        self._single = len(self.loaders) == 1
+        self.step(LOAD_FIRST_MS)
 
-    def _merge(self):
-        ents = []
+    def step(self, budget_ms=LOAD_STEP_MS):
+        """Parse more data within a time budget. True if anything changed."""
+        if self.fully_loaded:
+            return False
+        deadline = time.time() + budget_ms / 1000.0
+        changed = False
+        while True:
+            progressed = False
+            for ld in self.loaders:
+                if ld.at_eof:
+                    continue
+                if ld.read_chunk():
+                    changed = True
+                    progressed = True
+                self._integrate(ld)
+            if not progressed:
+                self.fully_loaded = True
+                break
+            if time.time() >= deadline:
+                break
+        return changed
+
+    def poll(self):
+        """Follow mode: pick up appended data. True if changed."""
+        changed = False
         for ld in self.loaders:
-            if ld.truncated:
-                self.truncated = True
-            ents.extend(ld.entries)
-        # stable sort: timestamp when available, otherwise keep load order
-        ents.sort(key=lambda e: (e.ts if e.ts is not None else float("inf"),
-                                 e.seq))
-        # rosout.log already aggregates all nodes; the per-node *.log files
-        # largely duplicate it. Dedupe identical (node,sev,msg) only ACROSS
-        # files — repeats inside one file are distinct events (e.g. periodic
-        # diagnostics) and must be kept.
-        seen_by_key = {}
-        uniq = []
-        for e in ents:
-            key = (e.node, e.sev, e.msg)
-            srcs = seen_by_key.setdefault(key, set())
-            if srcs and e.src not in srcs:
-                continue               # cross-file duplicate
-            srcs.add(e.src)
-            uniq.append(e)
-        self.entries = uniq
+            ld.at_eof = False
+            if ld.read_chunk():
+                changed = True
+            self._integrate(ld)
+        return changed
+
+    def progress(self):
+        """Fraction of the log files decoded so far (0..1)."""
+        total = sum(ld.file_size for ld in self.loaders)
+        if not total:
+            return 1.0
+        return min(1.0, sum(ld.size for ld in self.loaders) / float(total))
+
+    def _integrate(self, ld):
+        if ld.dropped_front:
+            ld.dropped_front = False
+            self.truncated = True
+            self._rebuild()
+            return
+        new = ld.entries[ld.sent:]
+        if not new:
+            return
+        ld.sent = len(ld.entries)
+        if self._single:
+            accepted = new
+        else:
+            # rosout.log already aggregates all nodes; per-node *.log files
+            # duplicate it. Dedupe identical (node,sev,msg) only ACROSS
+            # files — repeats inside one file are distinct events (e.g.
+            # periodic diagnostics) and must be kept.
+            accepted = []
+            for e in new:
+                key = (e.node, e.sev, e.msg)
+                srcs = self._key_srcs.get(key)
+                if srcs is None:
+                    self._key_srcs[key] = {e.src}
+                    accepted.append(e)
+                elif e.src in srcs:
+                    accepted.append(e)
+                else:
+                    srcs.add(e.src)
+        if not accepted:
+            return
+        self.entries.extend(accepted)
+        self.appended.extend(accepted)
+        need_sort = False
+        for e in accepted:
+            slot = self.nodes.setdefault(e.node,
+                                         {"counts": {}, "entries": []})
+            slot["entries"].append(e)
+            slot["counts"][e.sev] = slot["counts"].get(e.sev, 0) + 1
+            if e.ts is None:
+                continue
+            if self._last_ts is not None and e.ts < self._last_ts:
+                need_sort = True        # e.g. unsynced clock jumped back
+            self._last_ts = e.ts
+        if need_sort:
+            self._resort()
+
+    def _resort(self):
+        self.entries.sort(key=lambda e: (e.ts if e.ts is not None
+                                         else float("inf"), e.seq))
         self.nodes = {}
+        self._last_ts = None
         for e in self.entries:
             slot = self.nodes.setdefault(e.node,
                                          {"counts": {}, "entries": []})
             slot["entries"].append(e)
-            if e.sev:
-                slot["counts"][e.sev] = slot["counts"].get(e.sev, 0) + 1
+            slot["counts"][e.sev] = slot["counts"].get(e.sev, 0) + 1
+            if e.ts is not None:
+                self._last_ts = e.ts
+        self.dirty_order = True
 
-    def poll(self):
-        """Check files for appended data (follow mode). True if changed."""
-        changed = any(ld.read_available() for ld in self.loaders)
-        if changed:
-            self._merge()
-        return changed
+    def _rebuild(self):
+        """Fallback after per-file truncation: full eager merge."""
+        ents = []
+        for ld in self.loaders:
+            ents.extend(ld.entries)
+            ld.sent = len(ld.entries)
+        self.entries = ents
+        self._resort()
+        self.appended = []
 
     def node_names(self):
         rows = [(n, len(s["entries"])) for n, s in self.nodes.items()
@@ -482,6 +589,44 @@ def entry_visual_lines(e, width, wrap_on, with_node=False):
     return out
 
 
+def count_wrap_text(s, width):
+    """Line count of wrap_text(s, width) without building any strings."""
+    if width <= 0:
+        return 1
+    if len(s) <= width and s.isascii() and " " not in s.strip(" "):
+        return 1
+    n, curw = 0, 0
+    for word in s.split(" "):
+        ww = dwidth(word)
+        if ww > width:
+            if curw:
+                n += 1
+                curw = 0
+            full = (ww - 1) // width
+            n += full
+            ww -= full * width
+        if curw == 0:
+            curw = ww
+        elif curw + 1 + ww <= width:
+            curw += 1 + ww
+        else:
+            n += 1
+            curw = ww
+    return n + 1 if (curw or n == 0) else n
+
+
+def entry_line_count(e, width, wrap_on, with_node=False):
+    """Number of display lines for one entry (count-only, no strings)."""
+    prefix = log_prefix(e, with_node)
+    avail = width - len(prefix)
+    if avail < 4:
+        avail = 4
+    if not wrap_on:
+        return 1
+    segs = e.msg.split("\n") or [""]
+    return max(1, sum(count_wrap_text(clean(seg), avail) for seg in segs))
+
+
 # ---------------------------------------------------------------- UI
 
 class Theme(object):
@@ -574,19 +719,26 @@ class App(object):
         self.n_scroll = 0
         self.n_filter = ""
 
-        # log view state
+        # log view state — windowed/dynamic: visual lines exist only for a
+        # small range around the viewport and are built on demand while
+        # scrolling; nothing is pre-rendered for the whole file.
         self.l_node = ALL_NODE
-        self.l_scroll = 0
+        self.l_abs = 0            # absolute visual line index of the top row
+        self.vis = []             # built lines [(text, sev, entry, plen)]
+        self.vis_first = 0        # absolute index of self.vis[0]
+        self.vis_hi = 0           # absolute index one past the window
+        self.lo_ent = 0           # ents index of first entry in the window
+        self.hi_ent = 0           # ents index one past the last window entry
+        self.counts = []          # visual line count per entry (None unknown)
+        self.prefix = [0]         # prefix[i] = visual lines before ents[i]
+        self.prefix_valid = 0     # prefix is valid for ents[0:prefix_valid]
         self.follow = False
         self.wrap = True
         self.hidden = set()          # hidden severities
         self.needle = ""
-        self.matches = []            # visual-line indexes
+        self.matches = []            # absolute visual line indexes
         self.match_i = -1
-        self.vis = []                # [(text, sev, entry, prefix_len)]
-        self.vis_dirty = True
         self.vis_cache = {}          # (seq, w, wrap, with_node) -> [(line, plen)]
-        self.vis_truncated = False
 
         if args.path:
             self.session = Session(resolve_rosout(args.path),
@@ -657,7 +809,6 @@ class App(object):
         self.n_scroll = 0
         self.n_filter = ""
         self.l_node = ALL_NODE
-        self.vis_dirty = True
         self.needle = ""
 
     def reload_session(self):
@@ -667,7 +818,7 @@ class App(object):
         self.session.load()
         if keep_node not in self.session.nodes and keep_node != ALL_NODE:
             self.l_node = ALL_NODE
-        self.vis_dirty = True
+        self.reset_log_view()
 
     # ---------------------------------------------------------- log view
 
@@ -676,79 +827,172 @@ class App(object):
             return []
         return self.session.node_entries(self.l_node)
 
-    def rebuild_vis(self):
+    def reset_log_view(self):
+        """Drop the built window (node switch / reload / re-sort / rewrap)."""
+        self.vis = []
+        self.vis_first = 0
+        self.vis_hi = 0
+        self.lo_ent = 0
+        self.hi_ent = 0
+        self.counts = []
+        self.prefix = [0]
+        self.prefix_valid = 0
+        self.l_abs = 0
+        self.matches = []
+        self.match_i = -1
+
+    def _wrap_lines(self, e, w, with_node):
+        key = (e.seq, w, self.wrap, with_node)
+        lines = self.vis_cache.get(key)
+        if lines is None:
+            plen = len(log_prefix(e, with_node))
+            lines = [(ln, plen)
+                     for ln in entry_visual_lines(e, w, self.wrap, with_node)]
+            if len(self.vis_cache) > 150_000:
+                self.vis_cache.clear()
+            self.vis_cache[key] = lines
+        return lines
+
+    def _lines_of(self, ents, i, w, with_node):
+        """Visual line count of ents[i]; hidden entries contribute zero."""
+        if i < len(self.counts) and self.counts[i] is not None:
+            return self.counts[i]
+        e = ents[i]
+        n = 0 if e.sev in self.hidden else entry_line_count(e, w, self.wrap,
+                                                           with_node)
+        while len(self.counts) <= i:
+            self.counts.append(None)
+        self.counts[i] = n
+        return n
+
+    def _extend_prefix(self, ents, upto, w, with_node):
+        """prefix[i] = total visual lines before ents[i], up to `upto`."""
+        while self.prefix_valid < upto:
+            i = self.prefix_valid
+            n = self._lines_of(ents, i, w, with_node)
+            self.prefix.append(self.prefix[-1] + n)
+            self.prefix_valid += 1
+
+    def _total_lines(self, ents, w, with_node):
+        self._extend_prefix(ents, len(ents), w, with_node)
+        return self.prefix[-1]
+
+    def ensure_window(self):
+        """Build/trim visual lines so the viewport is covered, on demand.
+
+        Small scroll deltas grow the window incrementally; big jumps
+        relocate it by bisecting the count-only prefix array, so strings
+        are only ever built for a few screens around the viewport."""
         h, w = self.stdscr.getmaxyx()
-        ents = self.log_entries()
-        with_node = (self.l_node == ALL_NODE)
-        cache = self.vis_cache
-        vis = []
-        dropped_oldest = False
-        for e in ents:
-            if e.sev in self.hidden:
-                continue
-            key = (e.seq, w, self.wrap, with_node)
-            lines = cache.get(key)
-            if lines is None:
-                plen = len(log_prefix(e, with_node))
-                lines = [(ln, plen)
-                         for ln in entry_visual_lines(e, w, self.wrap,
-                                                      with_node)]
-                if len(cache) > 120_000:
-                    cache.clear()
-                cache[key] = lines
-            vis.extend((ln, e.sev, e, p) for ln, p in lines)
-            if len(vis) > MAX_VIS_LINES:
-                # keep the NEWEST entries: drop what we just built past cap
-                del vis[MAX_VIS_LINES:]
-                dropped_oldest = True
-                break
-        # when the full view doesn't fit, keep only the last MAX_VIS_LINES
-        if dropped_oldest and len(ents) > len(vis):
-            vis = []
-            for e in reversed(ents):
-                if e.sev in self.hidden:
-                    continue
-                key = (e.seq, w, self.wrap, with_node)
-                lines = cache.get(key)
-                if lines is None:
-                    plen = len(log_prefix(e, with_node))
-                    lines = [(ln, plen)
-                             for ln in entry_visual_lines(e, w, self.wrap,
-                                                          with_node)]
-                    if len(cache) > 120_000:
-                        cache.clear()
-                    cache[key] = lines
-                vis.extend((ln, e.sev, e, p) for ln, p in lines)
-                if len(vis) >= MAX_VIS_LINES:
-                    break
-            vis.reverse()
-        self.vis_truncated = dropped_oldest and True or False
-        self.vis = vis
-        self.vis_dirty = False
-        self.clamp_scroll()
-        if self.needle:
-            self.recompute_matches()
-            if self.match_i >= len(self.matches):
-                self.match_i = len(self.matches) - 1
-
-    def clamp_scroll(self):
-        h, _ = self.stdscr.getmaxyx()
         body = max(1, h - 3)
-        self.l_scroll = max(0, min(self.l_scroll, max(0, len(self.vis) - body)))
+        ents = self.log_entries()
+        with_node = self._with_node()
+        near = self.vis and (
+            self.vis_first - body * 3 <= self.l_abs <= self.vis_hi + body * 3)
+        if not near:
+            self._relocate_window(ents, w, with_node, body)
+        # grow upward (older lines) while scrolling near the window top
+        want_top = self.l_abs - body
+        while self.vis_first > want_top and self.lo_ent > 0:
+            i = self.lo_ent - 1
+            self.lo_ent = i
+            if self._lines_of(ents, i, w, with_node) == 0:
+                continue               # hidden: contributes no lines
+            lines = self._wrap_lines(ents[i], w, with_node)
+            wrapped = [(ln, ents[i].sev, ents[i], p) for ln, p in lines]
+            self.vis[:0] = wrapped
+            self.vis_first -= len(wrapped)
+        # grow downward (newer lines)
+        want_bot = self.l_abs + body * 2
+        while self.vis_hi < want_bot and self.hi_ent < len(ents):
+            i = self.hi_ent
+            self.hi_ent = i + 1
+            if self._lines_of(ents, i, w, with_node) == 0:
+                continue
+            lines = self._wrap_lines(ents[i], w, with_node)
+            wrapped = [(ln, ents[i].sev, ents[i], p) for ln, p in lines]
+            self.vis.extend(wrapped)
+            self.vis_hi += len(wrapped)
+        # clamp to available range
+        if self.vis_hi < self.l_abs + body:
+            self.l_abs = max(0, self.vis_hi - body)
+        if self.vis_first > self.l_abs:
+            self.l_abs = self.vis_first
+        # trim far-off lines (keep two screens of slack)
+        slack_top = self.l_abs - body
+        while self.vis and self.vis_first < slack_top:
+            self.vis.pop(0)
+            self.vis_first += 1
+        slack_bot = self.l_abs + body * 3
+        while self.vis and self.vis_hi > slack_bot:
+            self.vis.pop()
+            self.vis_hi -= 1
 
-    def scroll_bottom(self):
-        h, _ = self.stdscr.getmaxyx()
-        self.l_scroll = max(0, len(self.vis) - max(1, h - 3))
+    def _relocate_window(self, ents, w, with_node, body):
+        """Jump: locate the entry containing the top viewport line via
+        bisect over the count-only prefix, then build a fresh window.
+        The prefix is extended only as far as the jump target needs."""
+        if not ents:
+            self.vis = []
+            self.vis_first = self.vis_hi = 0
+            self.lo_ent = self.hi_ent = 0
+            self.l_abs = 0
+            return
+        need = self.l_abs + body * 2 + 64
+        while (self.prefix_valid < len(ents)
+               and self.prefix[self.prefix_valid] <= need):
+            self._extend_prefix(ents,
+                                min(len(ents), self.prefix_valid + 512),
+                                w, with_node)
+        total = self.prefix[self.prefix_valid]
+        target = max(0, min(self.l_abs, total - 1))
+        ei = bisect.bisect_right(self.prefix, target) - 1
+        ei = max(0, min(ei, len(ents) - 1, self.prefix_valid - 1))
+        while ei < len(ents) and self._lines_of(ents, ei, w, with_node) == 0:
+            ei += 1
+        if ei >= len(ents):            # everything below is hidden
+            ei = len(ents) - 1
+            while ei > 0 and self._lines_of(ents, ei, w, with_node) == 0:
+                ei -= 1
+        start = max(0, ei - 8)
+        self.vis = []
+        self.lo_ent = start
+        self.hi_ent = start
+        self.vis_first = self.prefix[start]
+        self.vis_hi = self.prefix[start]
+        while self.hi_ent < len(ents) and self.vis_hi < target + body * 2:
+            i = self.hi_ent
+            self.hi_ent = i + 1
+            if self._lines_of(ents, i, w, with_node) == 0:
+                continue
+            lines = self._wrap_lines(ents[i], w, with_node)
+            wrapped = [(ln, ents[i].sev, ents[i], p) for ln, p in lines]
+            self.vis.extend(wrapped)
+            self.vis_hi += len(wrapped)
 
     def recompute_matches(self):
+        """Full-text search over all entries (absolute visual indexes)."""
         self.matches = []
         self.match_i = -1
         if not self.needle:
             return
+        h, w = self.stdscr.getmaxyx()
+        ents = self.log_entries()
+        with_node = (self.l_node == ALL_NODE)
         nd = self.needle.casefold()
-        for i, (text, _, _, _) in enumerate(self.vis):
-            if nd in text.casefold():
-                self.matches.append(i)
+        for i, e in enumerate(ents):
+            self._extend_prefix(ents, i + 1, w, with_node)
+            start = self.prefix[i]
+            if e.sev in self.hidden:
+                continue
+            hit = nd in e.msg.casefold()
+            if not hit and with_node:
+                hit = nd in e.node.casefold()
+            if not hit:
+                hit = nd in fmt_ts(e.ts)  # e.g. search by time
+            if hit:
+                n = self._lines_of(ents, i, w, with_node)
+                self.matches.extend(range(start, start + n))
         if self.matches:
             self.match_i = 0
 
@@ -757,35 +1001,43 @@ class App(object):
             return
         self.match_i = (self.match_i + direction) % len(self.matches)
         h, _ = self.stdscr.getmaxyx()
-        self.l_scroll = max(0, min(self.matches[self.match_i],
-                                   max(0, len(self.vis) - max(1, h - 3))))
+        m = self.matches[self.match_i]
+        self.l_abs = max(0, m - max(1, h - 3) // 2)
 
     def search_from_current(self):
         self.recompute_matches()
         if not self.matches:
             return
-        # first match at/after current scroll, wrapping around
+        # first match at/after the current viewport, wrapping around
         for i, m in enumerate(self.matches):
-            if m >= self.l_scroll:
+            if m >= self.l_abs:
                 self.match_i = i
                 break
-        h, _ = self.stdscr.getmaxyx()
-        self.l_scroll = max(0, min(self.matches[self.match_i],
-                                   max(0, len(self.vis) - max(1, h - 3))))
+        self.goto_match(0)
 
     # ---------------------------------------------------------- main loop
 
     def run(self):
         while True:
-            if self.mode == "log" and self.follow and self.session:
-                if self.session.poll():
-                    self.vis_dirty = True
-            if self.vis_dirty and self.mode == "log":
-                self.rebuild_vis()
+            busy = False
+            if self.session is not None:
+                s = self.session
+                if not s.fully_loaded:
+                    busy = True
+                    if s.step(LOAD_STEP_MS) and self.mode == "log":
+                        self.ensure_window()
+                elif self.mode == "log" and self.follow:
+                    s.poll()
+                if s.dirty_order:          # entries re-sorted (clock jump)
+                    s.dirty_order = False
+                    self.reset_log_view()
+            if self.mode == "log":
+                self.ensure_window()
             try:
                 self.draw()
             except curses.error:
                 pass
+            self.stdscr.timeout(15 if busy else GETCH_TIMEOUT_MS)
             k = self.stdscr.getch()
             try:
                 self.handle(k)
@@ -809,8 +1061,7 @@ class App(object):
             self.help_on = True
             return
         if k == curses.KEY_RESIZE or k == 12:   # Ctrl+L
-            self.vis_dirty = True
-            self.clamp_scroll()
+            self.reset_log_view()
             return
         if self.mode == "sessions":
             self.handle_sessions(k)
@@ -909,11 +1160,8 @@ class App(object):
         elif k in (curses.KEY_ENTER, 10, 13) and n:
             self.l_node = rows[self.n_cur][0]
             self.mode = "log"
-            self.vis_dirty = True
             self.needle = ""
-            self.matches = []
-            self.rebuild_vis()
-            self.scroll_bottom()
+            self.reset_log_view()
         elif k == ord('/'):
             self.start_input("过滤节点: ", "nodefilter", self.n_filter)
         elif k == ord('s'):
@@ -934,41 +1182,41 @@ class App(object):
     def handle_log(self, k):
         h, _ = self.stdscr.getmaxyx()
         body = max(1, h - 3)
-        maxs = max(0, len(self.vis) - body)
         if k in (curses.KEY_UP, ord('k')):
             self.follow = False
-            self.l_scroll = max(0, self.l_scroll - 1)
+            self.l_abs = max(0, self.l_abs - 1)
         elif k in (curses.KEY_DOWN, ord('j')):
             self.follow = False
-            self.l_scroll = min(maxs, self.l_scroll + 1)
-        elif k in (curses.KEY_PPAGE,):
+            self.l_abs += 1
+        elif k == curses.KEY_PPAGE:
             self.follow = False
-            self.l_scroll = max(0, self.l_scroll - body)
+            self.l_abs -= body
         elif k == curses.KEY_NPAGE:
             self.follow = False
-            self.l_scroll = min(maxs, self.l_scroll + body)
+            self.l_abs += body
         elif k == 4:  # Ctrl+d
             self.follow = False
-            self.l_scroll = min(maxs, self.l_scroll + max(1, body // 2))
+            self.l_abs += max(1, body // 2)
         elif k == 21:  # Ctrl+u
             self.follow = False
-            self.l_scroll = max(0, self.l_scroll - max(1, body // 2))
+            self.l_abs -= max(1, body // 2)
         elif k == ord('g') or k == curses.KEY_HOME:
             self.follow = False
-            self.l_scroll = 0
+            self.l_abs = 0
         elif k in (ord('G'), curses.KEY_END):
             self.follow = False
-            self.scroll_bottom()
+            ents = self.log_entries()
+            total = self._total_lines(ents, self._w(), self._with_node())
+            self.l_abs = max(0, total - body)
         elif k == ord('f'):
             self.follow = not self.follow
-            if self.follow and self.session:
-                if self.session.poll():
-                    self.vis_dirty = True
-                    self.rebuild_vis()
-                self.scroll_bottom()
+            if self.follow:
+                ents = self.log_entries()
+                total = self._total_lines(ents, self._w(), self._with_node())
+                self.l_abs = max(0, total - body)
         elif k == ord('w'):
             self.wrap = not self.wrap
-            self.vis_dirty = True
+            self.reset_log_view()
         elif k == ord('/'):
             self.start_input("搜索: ", "search", self.needle)
         elif k in (ord('n'), ord('N')) and self.needle:
@@ -985,13 +1233,19 @@ class App(object):
                 self.hidden.discard(sev)
             else:
                 self.hidden.add(sev)
-            self.vis_dirty = True
+            self.reset_log_view()
         elif k in (27, ord('h'), curses.KEY_LEFT, curses.KEY_BACKSPACE,
                    8, 127):
             self.mode = "nodes"
         elif k == ord('r'):
             self.reload_session()
-        self.clamp_scroll()
+        self.ensure_window()
+
+    def _w(self):
+        return self.stdscr.getmaxyx()[1]
+
+    def _with_node(self):
+        return self.l_node == ALL_NODE
 
     # ---------------------------------------------------------- drawing
 
@@ -1064,6 +1318,8 @@ class App(object):
         tmin = s.entries[0].ts if s.entries else None
         tmax = s.entries[-1].ts if s.entries else None
         meta = " 节点 %d │ 日志 %s 条" % (len(s.nodes), commify(len(s.entries)))
+        if not s.fully_loaded:
+            meta += " │ 加载中 %d%%" % int(s.progress() * 100)
         if tmin is not None and tmax is not None:
             meta += " │ %s ~ %s" % (fmt_ts(tmin), fmt_ts(tmax))
         self.addstr(1, 0, clip_to_width(meta + "  " + s.rosout_path, w - 1),
@@ -1105,25 +1361,47 @@ class App(object):
         self.draw_bottom_bar(
             h, w, " ↑↓ j/k 选择  Enter 查看日志  / 过滤  s 会话  r 刷新  q 退出  ? 帮助")
 
+    def _visible_count(self):
+        """Entries shown for the current node and level filter."""
+        s = self.session
+        if s is None:
+            return 0
+        counts = s.node_counts(self.l_node)
+        total = sum(counts.values())
+        hidden = sum(v for k, v in counts.items() if k in self.hidden)
+        return total - hidden
+
     def draw_log(self, h, w):
         th = self.theme
-        if self.vis_dirty:
-            self.rebuild_vis()
         s = self.session
         disp = "/" + self.l_node if self.l_node not in (ALL_NODE, UNKNOWN_NODE) \
             else self.l_node
-        head = " %s ▸ %s ▸ %s 条" % (s.name, disp, commify(len(self.vis)))
+        head = " %s ▸ %s ▸ %s 条" % (s.name, disp,
+                                     commify(self._visible_count()))
+        if not s.fully_loaded:
+            head += " │ 加载中 %d%%" % int(s.progress() * 100)
         self.addstr(0, 0, clip_to_width(head, w - 12), th.head)
         body = max(1, h - 3)
-        maxs = max(0, len(self.vis) - body)
-        pct = 100 if not maxs else int(100.0 * self.l_scroll / maxs)
-        if self.follow:
+        ents = self.log_entries()
+        with_node = self._with_node()
+        # approximate scroll percentage from the window's entry coverage
+        if self.hi_ent >= len(ents) and self.vis_hi < self.l_abs + body:
             pct = 100
+        elif len(ents) == 0:
+            pct = 100
+        else:
+            span = max(1, self.vis_hi - self.vis_first)
+            frac = (self.l_abs + body / 2.0 - self.vis_first) / span
+            frac = min(1.0, max(0.0, frac))
+            ent = self.lo_ent + frac * (self.hi_ent - self.lo_ent)
+            pct = int(100.0 * ent / max(1, len(ents)))
         self.addstr(0, max(0, w - 11), "%4d%%" % pct, th.dim)
+        # render the viewport out of the built window
+        start = self.l_abs - self.vis_first
         for row in range(body):
-            idx = self.l_scroll + row
-            if idx >= len(self.vis):
-                break
+            idx = start + row
+            if idx < 0 or idx >= len(self.vis):
+                continue
             text, sev, _e, plen = self.vis[idx]
             y = 1 + row
             self.addstr(y, 0, text, th.sev(sev))
@@ -1143,7 +1421,7 @@ class App(object):
                 st += " │ /%s (无匹配)" % self.needle
         if self.follow:
             st += " │ ●跟随"
-        if s.truncated or self.vis_truncated:
+        if s.truncated:
             st += " │ (已截断,仅显示最新部分)"
         self.addstr(h - 2, 0, clip_to_width(st, w), th.status)
         self.draw_bottom_bar(

@@ -6,11 +6,19 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import rosview as rv
 
+
+def finish(s):
+    """Drive incremental parsing to completion."""
+    while not s.fully_loaded:
+        s.step(1000)
+    return s
+
+
 FIXTURE = os.path.join(os.path.dirname(__file__),
                        "fixtures", "2026-09-10T12-00-00-demo-1234",
                        "rosout.log")
 
-s = rv.Session(FIXTURE)
+s = finish(rv.Session(FIXTURE))
 nodes = dict(s.node_names())
 assert nodes.get("talker") == 3, nodes
 assert nodes.get("driver") == 5, nodes      # 4 from rosout + 1 unique node-file line
@@ -55,12 +63,12 @@ open(s.rosout_path, "w").writelines(
 # same-file repeats are distinct events — must NOT be deduped (v1.0.1 fix)
 rep = os.path.join(os.path.dirname(__file__), "fixtures", "repeat",
                    "rosout.log")
-r = rv.Session(rep, include_node_files=False)
+r = finish(rv.Session(rep, include_node_files=False))
 assert len(r.entries) == 6, len(r.entries)      # 5 identical + 1 other
 diag = [e for e in r.entries if "Diag" in e.msg]
 assert len(diag) == 5, len(diag)
 # cross-file dedupe (rosout vs node file) still collapses real duplicates
-xf = rv.Session(FIXTURE)
+xf = finish(rv.Session(FIXTURE))
 assert dict(xf.node_names()).get(rv.ALL_NODE) == 12
 
 # wrapping
@@ -77,7 +85,7 @@ sess = rv.find_sessions()
 assert len(sess) > 0, "no sessions under %s" % rv.ROS_LOG_ROOT
 rosout = rv.resolve_rosout(os.path.expanduser("~/.ros/log/latest"))
 assert os.path.isfile(rosout)
-real = rv.Session(rosout, include_node_files=False)
+real = finish(rv.Session(rosout, include_node_files=False))
 assert len(real.entries) > 5
 assert not any("[topics:" in e.msg for e in real.entries[:10])
 
