@@ -21,7 +21,7 @@ import sys
 import time
 import unicodedata
 
-VERSION = "1.0.4"
+VERSION = "1.0.5"
 MAX_LINES_PER_FILE = 200_000      # keep last N lines per file
 GETCH_TIMEOUT_MS = 400            # poll interval for follow mode
 LOAD_FIRST_MS = 250               # parse budget before showing the UI
@@ -179,6 +179,7 @@ class FileLoader(object):
         self.sent = 0                   # entries handed to the Session
         self.at_eof = False
         self.dropped_front = False      # cap truncation since last integrate
+        self.dropped_entries = None     # refs of entries purged by the cap
         self.truncated = False
         self._pending_b = b""
 
@@ -244,7 +245,7 @@ class FileLoader(object):
         if st.st_size <= self.size:
             self.at_eof = True       # caught up; poll() re-arms this
             return False
-        chunk = self.f.read(1 << 20)
+        chunk = self.f.read(1 << 18)   # 256KB: keeps one parse slice ~10ms
         if not chunk:
             self.at_eof = True
             return False
@@ -261,7 +262,9 @@ class FileLoader(object):
         hard = MAX_LINES_PER_FILE + MAX_LINES_PER_FILE // 10
         if len(self.entries) > hard:
             drop = len(self.entries) - MAX_LINES_PER_FILE
+            dropped = self.entries[:drop]     # keep refs for identity purge
             del self.entries[:drop]
+            self.dropped_entries = (self.dropped_entries or []) + dropped
             self.sent = max(0, self.sent - drop)
             self.truncated = True
             self.dropped_front = True
@@ -293,13 +296,9 @@ class Session(object):
         self.truncated = False
         self.fully_loaded = False
         self.appended = []      # entries accepted since last drain
-        self.dirty_order = False        # entries were re-sorted
-        self._unsorted = False          # out-of-order data seen, sort pending
-        self._need_rebuild = False      # deferred purge after cap truncation
-        self._last_resort = 0.0
+        self.dirty_order = False        # entries list was rebuilt (purge)
         self._key_srcs = {}
         self._single = False    # single file: no cross-file dedupe needed
-        self._last_ts = None
         self.load()
 
     # -- loading
@@ -314,11 +313,7 @@ class Session(object):
         self.fully_loaded = False
         self.appended = []
         self.dirty_order = False
-        self._unsorted = False
-        self._need_rebuild = False
-        self._last_resort = 0.0
         self._key_srcs = {}
-        self._last_ts = None
         counter = [0]
         src = 0
         ld = FileLoader(self.rosout_path, UNKNOWN_NODE, counter, src)
@@ -350,6 +345,8 @@ class Session(object):
             for ld in self.loaders:
                 if ld.at_eof:
                     continue
+                if time.time() >= deadline:
+                    return changed     # check per loader, not per sweep
                 if ld.read_chunk():
                     changed = True
                     progressed = True
@@ -357,15 +354,6 @@ class Session(object):
             if not progressed:
                 self.fully_loaded = True
                 break
-            if time.time() >= deadline:
-                break
-        if self.fully_loaded:
-            if self._unsorted:
-                self._unsorted = False
-                self._resort()      # one sort at completion, not per batch
-            if self._need_rebuild:
-                self._need_rebuild = False
-                self._rebuild()     # one purge at completion, not per chunk
         return changed
 
     def poll(self, budget_ms=100):
@@ -375,26 +363,12 @@ class Session(object):
         for ld in self.loaders:
             ld.at_eof = False
             while True:
+                if time.time() >= deadline:
+                    return changed     # keep ticks short, resume next time
                 if not ld.read_chunk():
                     break
                 changed = True
-                if time.time() >= deadline:
-                    break
             self._integrate(ld)
-        if self._unsorted or self._need_rebuild:
-            # a live writer emitting out-of-order timestamps (unsynced
-            # clock) or repeated cap truncations would otherwise force a
-            # full re-sort/rebuild on every tick; throttle while data
-            # keeps arriving, run once when it stops
-            now = time.time()
-            if not changed or now - self._last_resort >= 2.0:
-                self._unsorted = False
-                self._last_resort = now
-                if self._need_rebuild:
-                    self._need_rebuild = False
-                    self._rebuild()
-                else:
-                    self._resort()
         return changed
 
     def progress(self):
@@ -407,9 +381,7 @@ class Session(object):
     def _integrate(self, ld):
         if ld.dropped_front:
             ld.dropped_front = False
-            self.truncated = True
-            self._need_rebuild = True   # purge deferred; rebuild once done
-            # fall through: the loader's surviving tail integrates normally
+            self._purge_dropped(ld)     # trim cap-truncated entries
         new = ld.entries[ld.sent:]
         if not new:
             return
@@ -432,55 +404,37 @@ class Session(object):
                     accepted.append(e)
                 else:
                     srcs.add(e.src)
-        if not accepted:
-            return
-        self.entries.extend(accepted)
-        self.appended.extend(accepted)
         for e in accepted:
-            slot = self.nodes.setdefault(e.node,
-                                         {"counts": {}, "entries": []})
-            slot["entries"].append(e)
-            slot["counts"][e.sev] = slot["counts"].get(e.sev, 0) + 1
-            if e.ts is None:
-                continue
-            if self._last_ts is not None and e.ts < self._last_ts:
-                self._unsorted = True   # e.g. unsynced clock jumped back
-            self._last_ts = e.ts
+            self._insert(e)
+        if accepted:
+            self.appended.extend(accepted)
 
-    def _resort(self):
-        self._last_resort = time.time()
-        self.entries.sort(key=lambda e: (e.ts if e.ts is not None
-                                         else float("inf"), e.seq))
+    def _insert(self, e):
+        """Append in arrival (write) order — never re-sorted; the
+        timestamp is display-only."""
+        self.entries.append(e)
+        slot = self.nodes.setdefault(e.node,
+                                     {"counts": {}, "entries": []})
+        slot["entries"].append(e)
+        slot["counts"][e.sev] = slot["counts"].get(e.sev, 0) + 1
+
+    def _purge_dropped(self, ld):
+        """The loader's cap truncated its own tail; drop the same
+        entries here by identity and rebuild the per-node index."""
+        dropped = ld.dropped_entries
+        ld.dropped_entries = None
+        if not dropped:
+            return
+        gone = set(map(id, dropped))
+        self.entries = [e for e in self.entries if id(e) not in gone]
         self.nodes = {}
-        self._last_ts = None
         for e in self.entries:
             slot = self.nodes.setdefault(e.node,
                                          {"counts": {}, "entries": []})
             slot["entries"].append(e)
             slot["counts"][e.sev] = slot["counts"].get(e.sev, 0) + 1
-            if e.ts is not None:
-                self._last_ts = e.ts
-        self.dirty_order = True
-
-    def _rebuild(self):
-        """Fallback after per-file truncation: full eager merge."""
-        ents = []
-        self._key_srcs = {}
-        for ld in self.loaders:
-            for e in ld.entries:
-                if self._single:
-                    ents.append(e)
-                    continue
-                key = (e.node, e.sev, e.msg)
-                srcs = self._key_srcs.setdefault(key, set())
-                if srcs and e.src not in srcs:
-                    continue           # cross-file duplicate
-                srcs.add(e.src)
-                ents.append(e)
-            ld.sent = len(ld.entries)
-        self.entries = ents
-        self._resort()
-        self.appended = []
+        self.truncated = True
+        self.dirty_order = True        # UI window indexes must reset
 
     def node_names(self):
         rows = [(n, len(s["entries"])) for n, s in self.nodes.items()
@@ -1070,12 +1024,12 @@ class App(object):
                     # the file may still be growing: always pick up appends
                     # on the idle tick, even outside follow mode
                     s.poll(60)
-                if s.dirty_order:          # entries re-sorted (clock jump)
-                    s.dirty_order = False
-                    self._after_resort()
-                elif s.appended:
+                if s.appended:
                     self._after_append(s.appended)
                     s.appended = []
+                if s.dirty_order:          # entries list was purged
+                    s.dirty_order = False
+                    self._after_purge()
             if self.mode == "log":
                 self.ensure_window()
             try:
@@ -1119,39 +1073,36 @@ class App(object):
             return None
         return self.prefix[i]
 
-    def _after_resort(self):
-        """A re-sort reordered history: keep showing the same entry."""
-        if self.mode == "log":
-            anchor = self._anchor_entry()
-            at_bottom = self.vis_hi <= self.l_abs + max(1, self._h() - 3) + 8
-        else:
-            anchor, at_bottom = None, False
+    def _after_purge(self):
+        """Cap truncation removed head entries: realign the view."""
+        anchor = self._anchor_entry() if self.mode == "log" else None
         self.reset_log_view()
-        if at_bottom:
+        pos = self._abs_of_entry(anchor) if anchor is not None else None
+        if pos is None:
+            # anchor was truncated away (or hidden): show the newest
             ents = self.log_entries()
             total = self._total_lines(ents, self._w(), self._with_node())
             self.l_abs = max(0, total - max(1, self._h() - 3))
         else:
-            pos = self._abs_of_entry(anchor) if anchor is not None else None
-            if pos is None:
-                # anchor was truncated away (or hidden): show the newest
-                ents = self.log_entries()
-                total = self._total_lines(ents, self._w(), self._with_node())
-                self.l_abs = max(0, total - max(1, self._h() - 3))
-            else:
-                self.l_abs = pos
+            self.l_abs = pos
 
     def _after_append(self, appended):
         """New entries appended in file order (no re-sort)."""
         if self.mode != "log":
             return
-        if self.needle:
-            # count-only search over the appended tail, extend matches
+        if self.needle and self.matches:
+            # extend the existing match list over the appended tail only
+            # (bounded work per tick; a huge backlog is irrelevant because
+            # the user is reading old matches, not the tail)
             w = self._w()
             ents = self.log_entries()
             with_node = self._with_node()
             nd = self.needle.casefold()
-            for e in appended:
+            tail_start = max(0, len(ents) - len(appended) - 8)
+            count_from = self.prefix[self.prefix_valid - 1] \
+                if self.prefix_valid else 0
+            for i in range(tail_start, len(ents)):
+                e = ents[i]
                 if e.node != self.l_node and self.l_node != ALL_NODE:
                     continue
                 if e.sev in self.hidden:
@@ -1163,24 +1114,16 @@ class App(object):
                     hit = nd in fmt_ts(e.ts)
                 if not hit:
                     continue
-                # appended entries live at the tail; scan a bounded window
-                # instead of the whole list (identity comparison)
-                i = None
-                tail = ents[-min(len(ents), len(appended) * 2 + 8):]
-                for j in range(len(tail) - 1, -1, -1):
-                    if tail[j] is e:
-                        i = len(ents) - len(tail) + j
-                        break
-                if i is None:
-                    continue
                 self._extend_prefix(ents, i + 1, w, with_node)
                 start = self.prefix[i]
                 n = self._lines_of(ents, i, w, with_node)
                 self.matches.extend(range(start, start + n))
         if self.follow:
+            # one count-only pass to the new end; bounded per tick
             ents = self.log_entries()
-            total = self._total_lines(ents, self._w(), self._with_node())
-            self.l_abs = max(0, total - max(1, self._h() - 3))
+            self._extend_prefix(ents, len(ents), self._w(),
+                                self._with_node())
+            self.l_abs = max(0, self.prefix[-1] - max(1, self._h() - 3))
 
     def _h(self):
         return self.stdscr.getmaxyx()[0]
