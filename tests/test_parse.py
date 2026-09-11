@@ -74,11 +74,21 @@ assert dict(xf.node_names()).get(rv.ALL_NODE) == 12
 # wrapping
 E = lambda msg, sev=rv.SEV_INFO: rv.Entry(1757486400, sev, "t", msg, 0)
 lines = rv.entry_visual_lines(E("a " * 30), 40, True)
-assert len(lines) > 1 and all(rv.dwidth(l) <= 40 for l in lines)
+assert len(lines) > 1 and all(rv.dwidth(l) <= 40 for l, d in lines)
+assert all(isinstance(d, tuple) for l, d in lines)
 cjk = rv.entry_visual_lines(E("中" * 50), 30, True)
-assert all(rv.dwidth(l) <= 30 for l in cjk)
+assert all(rv.dwidth(l) <= 30 for l, d in cjk)
 flat = rv.entry_visual_lines(E("a " * 100), 40, False)
 assert len(flat) == 1
+# head dims: timestamp dimmed; source-path bracket dimmed, message bright
+e = rv.Entry(1789018982.23, rv.SEV_INFO, "api_routes",
+             "[/home/u/api.cpp:273(pub)] [Telemetry Pub] hello", 0)
+hl = rv.entry_visual_lines(e, 200, True, False)
+text, dims = hl[0]
+assert dims[0] == (0, 8), dims
+assert any(a == text.index("[/home") for a, b in dims), (dims, text)
+rest = text[text.index("[Telemetry"):]
+assert not any(text[a:b] == rest for a, b in dims)  # message not dimmed
 
 # real environment: ~/.ros/log exists with sessions and latest
 sess = rv.find_sessions()

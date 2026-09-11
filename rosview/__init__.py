@@ -21,7 +21,7 @@ import sys
 import time
 import unicodedata
 
-VERSION = "1.0.5"
+VERSION = "1.0.6"
 MAX_LINES_PER_FILE = 200_000      # keep last N lines per file
 GETCH_TIMEOUT_MS = 400            # poll interval for follow mode
 LOAD_FIRST_MS = 250               # parse budget before showing the UI
@@ -55,6 +55,9 @@ MONO_RE = re.compile(
     r'(?P<node>/[^\s\[]+)?\s*'
     r'(?P<msg>(?:\[[^\n]*)|\S.*)$')
 MONO_TOPICS_RE = re.compile(r'\s*\[topics:[^\]]*\]')
+# source-location bracket like [/path/file.cpp:123(func)]
+MONO_PATH_RE = re.compile(r'\[[^\[\]]*\([^()]*\)\]')
+MONO_PATH_START_RE = re.compile(r'^\[[^\[\]]*\([^()]*\)\]')
 # "<ts>  Node Startup" — rosout restarts mark run boundaries
 MONO_STARTUP_RE = re.compile(
     r'^\s*(?P<ts>\d{1,13}\.\d{1,9})\s+Node Startup\s*$')
@@ -559,15 +562,21 @@ def log_prefix(e, with_node):
 def entry_visual_lines(e, width, wrap_on, with_node=False):
     """Composed display lines for one entry: 'HH:MM:SS LEVEL  msg'.
 
-    With with_node, a fixed-width node column is inserted after the level."""
+    Returns (line, dims) pairs; dims are the character ranges to render
+    dim (timestamp + boilerplate source path) so message bodies stand
+    out and entry boundaries stay visible. With with_node, a fixed-width
+    node column is inserted after the level."""
     prefix = log_prefix(e, with_node)
     avail = width - len(prefix)
     if avail < 4:
         avail = 4
+    # does the message carry a source-location bracket at its start?
+    has_path = bool(MONO_PATH_START_RE.match(e.msg))
     out = []
     if not wrap_on:
         flat = e.msg.replace("\n", " ⏎ ")
-        out.append(prefix + clip_to_width(flat, avail))
+        text = prefix + clip_to_width(flat, avail)
+        out.append((text, _head_dims(text, has_path)))
         return out
     segs = e.msg.split("\n")
     if not segs:
@@ -576,12 +585,26 @@ def entry_visual_lines(e, width, wrap_on, with_node=False):
     first = True
     for seg in segs:
         for ln in wrap_text(clean(seg), avail):
-            out.append((prefix if first else indent) + ln)
+            text = (prefix if first else indent) + ln
+            out.append((text, _head_dims(text, has_path) if first else ()))
             first = False
         first = False
     if not out:
-        out.append(prefix)
+        out.append((prefix, ()))
     return out
+
+
+def _head_dims(text, has_path):
+    """Dim ranges for a head line: the timestamp, plus the source-path
+    bracket when it is present (dim the whole rest when the path is
+    split onto the next line)."""
+    dims = [(0, 8)]                     # HH:MM:SS
+    m = MONO_PATH_RE.search(text)
+    if m:
+        dims.append((m.start(), m.end()))
+    elif has_path and len(text) > 8:
+        dims.append((8, len(text)))     # path wrapped: head is all boilerplate
+    return tuple(dims)
 
 
 def count_wrap_text(s, width):
@@ -719,7 +742,7 @@ class App(object):
         # scrolling; nothing is pre-rendered for the whole file.
         self.l_node = ALL_NODE
         self.l_abs = 0            # absolute visual line index of the top row
-        self.vis = []             # built lines [(text, sev, entry, plen)]
+        self.vis = []             # built lines [(text, sev, entry, dims)]
         self.vis_first = 0        # absolute index of self.vis[0]
         self.vis_hi = 0           # absolute index one past the window
         self.lo_ent = 0           # ents index of first entry in the window
@@ -840,9 +863,7 @@ class App(object):
         key = (e.seq, w, self.wrap, with_node)
         lines = self.vis_cache.get(key)
         if lines is None:
-            plen = len(log_prefix(e, with_node))
-            lines = [(ln, plen)
-                     for ln in entry_visual_lines(e, w, self.wrap, with_node)]
+            lines = entry_visual_lines(e, w, self.wrap, with_node)
             if len(self.vis_cache) > 150_000:
                 self.vis_cache.clear()
             self.vis_cache[key] = lines
@@ -894,7 +915,7 @@ class App(object):
             if self._lines_of(ents, i, w, with_node) == 0:
                 continue               # hidden: contributes no lines
             lines = self._wrap_lines(ents[i], w, with_node)
-            wrapped = [(ln, ents[i].sev, ents[i], p) for ln, p in lines]
+            wrapped = [(ln, ents[i].sev, ents[i], d) for ln, d in lines]
             self.vis[:0] = wrapped
             self.vis_first -= len(wrapped)
         # grow downward (newer lines)
@@ -905,7 +926,7 @@ class App(object):
             if self._lines_of(ents, i, w, with_node) == 0:
                 continue
             lines = self._wrap_lines(ents[i], w, with_node)
-            wrapped = [(ln, ents[i].sev, ents[i], p) for ln, p in lines]
+            wrapped = [(ln, ents[i].sev, ents[i], d) for ln, d in lines]
             self.vis.extend(wrapped)
             self.vis_hi += len(wrapped)
         # clamp to available range
@@ -913,15 +934,33 @@ class App(object):
             self.l_abs = max(0, self.vis_hi - body)
         if self.vis_first > self.l_abs:
             self.l_abs = self.vis_first
-        # trim far-off lines (keep two screens of slack)
+        # trim far-off lines (keep two screens of slack). Trimming must
+        # remove WHOLE entries and move lo_ent/hi_ent with the lines —
+        # popping bare lines desyncs the entry cursors and the window
+        # then skips or duplicates entries on the next grow (nondeterministic
+        # garbled rendering in wrap mode).
         slack_top = self.l_abs - body
-        while self.vis and self.vis_first < slack_top:
-            self.vis.pop(0)
-            self.vis_first += 1
+        while self.lo_ent < self.hi_ent and self.vis:
+            n = self._lines_of(ents, self.lo_ent, w, with_node)
+            if n == 0:
+                self.lo_ent += 1
+                continue
+            if self.vis_first + n > slack_top or len(self.vis) < n:
+                break
+            del self.vis[:n]
+            self.vis_first += n
+            self.lo_ent += 1
         slack_bot = self.l_abs + body * 3
-        while self.vis and self.vis_hi > slack_bot:
-            self.vis.pop()
-            self.vis_hi -= 1
+        while self.hi_ent > self.lo_ent and self.vis:
+            n = self._lines_of(ents, self.hi_ent - 1, w, with_node)
+            if n == 0:
+                self.hi_ent -= 1
+                continue
+            if self.vis_hi - n < slack_bot or len(self.vis) < n:
+                break
+            del self.vis[-n:]
+            self.vis_hi -= n
+            self.hi_ent -= 1
 
     def _relocate_window(self, ents, w, with_node, body):
         """Jump: locate the entry containing the top viewport line via
@@ -961,7 +1000,7 @@ class App(object):
             if self._lines_of(ents, i, w, with_node) == 0:
                 continue
             lines = self._wrap_lines(ents[i], w, with_node)
-            wrapped = [(ln, ents[i].sev, ents[i], p) for ln, p in lines]
+            wrapped = [(ln, ents[i].sev, ents[i], d) for ln, d in lines]
             self.vis.extend(wrapped)
             self.vis_hi += len(wrapped)
 
@@ -1490,11 +1529,11 @@ class App(object):
             idx = start + row
             if idx < 0 or idx >= len(self.vis):
                 continue
-            text, sev, _e, plen = self.vis[idx]
+            text, sev, _e, dims = self.vis[idx]
             y = 1 + row
             self.addstr(y, 0, text, th.sev(sev))
-            if len(text) > plen:
-                self.addstr(y, 0, text[:plen], th.dim)
+            for a, b in dims:
+                self.addstr(y, a, text[a:b], th.dim)
             self.add_spans(y, text, self.needle, th.hi)
         st = " "
         if self.hidden:
