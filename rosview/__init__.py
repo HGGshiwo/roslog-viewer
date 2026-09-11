@@ -21,7 +21,7 @@ import sys
 import time
 import unicodedata
 
-VERSION = "1.0.3"
+VERSION = "1.0.4"
 MAX_LINES_PER_FILE = 200_000      # keep last N lines per file
 GETCH_TIMEOUT_MS = 400            # poll interval for follow mode
 LOAD_FIRST_MS = 250               # parse budget before showing the UI
@@ -258,7 +258,8 @@ class FileLoader(object):
         self._pending_b = lines.pop()
         for lb in lines:
             self._line(lb.decode("utf-8", "replace"))
-        if len(self.entries) > MAX_LINES_PER_FILE:
+        hard = MAX_LINES_PER_FILE + MAX_LINES_PER_FILE // 10
+        if len(self.entries) > hard:
             drop = len(self.entries) - MAX_LINES_PER_FILE
             del self.entries[:drop]
             self.sent = max(0, self.sent - drop)
@@ -293,6 +294,9 @@ class Session(object):
         self.fully_loaded = False
         self.appended = []      # entries accepted since last drain
         self.dirty_order = False        # entries were re-sorted
+        self._unsorted = False          # out-of-order data seen, sort pending
+        self._need_rebuild = False      # deferred purge after cap truncation
+        self._last_resort = 0.0
         self._key_srcs = {}
         self._single = False    # single file: no cross-file dedupe needed
         self._last_ts = None
@@ -310,6 +314,9 @@ class Session(object):
         self.fully_loaded = False
         self.appended = []
         self.dirty_order = False
+        self._unsorted = False
+        self._need_rebuild = False
+        self._last_resort = 0.0
         self._key_srcs = {}
         self._last_ts = None
         counter = [0]
@@ -352,16 +359,42 @@ class Session(object):
                 break
             if time.time() >= deadline:
                 break
+        if self.fully_loaded:
+            if self._unsorted:
+                self._unsorted = False
+                self._resort()      # one sort at completion, not per batch
+            if self._need_rebuild:
+                self._need_rebuild = False
+                self._rebuild()     # one purge at completion, not per chunk
         return changed
 
-    def poll(self):
-        """Follow mode: pick up appended data. True if changed."""
+    def poll(self, budget_ms=100):
+        """Pick up appended data (idle tick / follow). True if changed."""
+        deadline = time.time() + budget_ms / 1000.0
         changed = False
         for ld in self.loaders:
             ld.at_eof = False
-            if ld.read_chunk():
+            while True:
+                if not ld.read_chunk():
+                    break
                 changed = True
+                if time.time() >= deadline:
+                    break
             self._integrate(ld)
+        if self._unsorted or self._need_rebuild:
+            # a live writer emitting out-of-order timestamps (unsynced
+            # clock) or repeated cap truncations would otherwise force a
+            # full re-sort/rebuild on every tick; throttle while data
+            # keeps arriving, run once when it stops
+            now = time.time()
+            if not changed or now - self._last_resort >= 2.0:
+                self._unsorted = False
+                self._last_resort = now
+                if self._need_rebuild:
+                    self._need_rebuild = False
+                    self._rebuild()
+                else:
+                    self._resort()
         return changed
 
     def progress(self):
@@ -375,8 +408,8 @@ class Session(object):
         if ld.dropped_front:
             ld.dropped_front = False
             self.truncated = True
-            self._rebuild()
-            return
+            self._need_rebuild = True   # purge deferred; rebuild once done
+            # fall through: the loader's surviving tail integrates normally
         new = ld.entries[ld.sent:]
         if not new:
             return
@@ -403,7 +436,6 @@ class Session(object):
             return
         self.entries.extend(accepted)
         self.appended.extend(accepted)
-        need_sort = False
         for e in accepted:
             slot = self.nodes.setdefault(e.node,
                                          {"counts": {}, "entries": []})
@@ -412,12 +444,11 @@ class Session(object):
             if e.ts is None:
                 continue
             if self._last_ts is not None and e.ts < self._last_ts:
-                need_sort = True        # e.g. unsynced clock jumped back
+                self._unsorted = True   # e.g. unsynced clock jumped back
             self._last_ts = e.ts
-        if need_sort:
-            self._resort()
 
     def _resort(self):
+        self._last_resort = time.time()
         self.entries.sort(key=lambda e: (e.ts if e.ts is not None
                                          else float("inf"), e.seq))
         self.nodes = {}
@@ -434,8 +465,18 @@ class Session(object):
     def _rebuild(self):
         """Fallback after per-file truncation: full eager merge."""
         ents = []
+        self._key_srcs = {}
         for ld in self.loaders:
-            ents.extend(ld.entries)
+            for e in ld.entries:
+                if self._single:
+                    ents.append(e)
+                    continue
+                key = (e.node, e.sev, e.msg)
+                srcs = self._key_srcs.setdefault(key, set())
+                if srcs and e.src not in srcs:
+                    continue           # cross-file duplicate
+                srcs.add(e.src)
+                ents.append(e)
             ld.sent = len(ld.entries)
         self.entries = ents
         self._resort()
@@ -1024,13 +1065,17 @@ class App(object):
                 s = self.session
                 if not s.fully_loaded:
                     busy = True
-                    if s.step(LOAD_STEP_MS) and self.mode == "log":
-                        self.ensure_window()
-                elif self.mode == "log" and self.follow:
-                    s.poll()
+                    s.step(LOAD_STEP_MS)
+                else:
+                    # the file may still be growing: always pick up appends
+                    # on the idle tick, even outside follow mode
+                    s.poll(60)
                 if s.dirty_order:          # entries re-sorted (clock jump)
                     s.dirty_order = False
-                    self.reset_log_view()
+                    self._after_resort()
+                elif s.appended:
+                    self._after_append(s.appended)
+                    s.appended = []
             if self.mode == "log":
                 self.ensure_window()
             try:
@@ -1039,10 +1084,106 @@ class App(object):
                 pass
             self.stdscr.timeout(15 if busy else GETCH_TIMEOUT_MS)
             k = self.stdscr.getch()
-            try:
-                self.handle(k)
-            except Quit:
-                return
+            while k != -1:
+                try:
+                    self.handle(k)
+                except Quit:
+                    return
+                # drain the rest of the burst before redrawing (5ms still
+                # lets curses see multi-byte escape sequences)
+                self.stdscr.timeout(5)
+                k = self.stdscr.getch()
+
+    def _anchor_entry(self):
+        """Entry shown at the top viewport row (None if above window)."""
+        off = self.l_abs - self.vis_first
+        for text, sev, e, plen in self.vis:
+            if off == 0:
+                return e
+            off -= 1
+        # viewport below the window: anchor on its newest entry (objects
+        # stay valid even when Session.entries gets rebuilt/truncated)
+        if self.vis:
+            return self.vis[-1][2]
+        return None
+
+    def _abs_of_entry(self, e):
+        """Absolute visual line of an entry's first line (None if hidden)."""
+        ents = self.log_entries()
+        try:
+            i = ents.index(e)
+        except ValueError:
+            return None
+        self._extend_prefix(ents, i + 1, self._w(), self._with_node())
+        if self._lines_of(ents, i, self._w(), self._with_node()) == 0:
+            return None
+        return self.prefix[i]
+
+    def _after_resort(self):
+        """A re-sort reordered history: keep showing the same entry."""
+        if self.mode == "log":
+            anchor = self._anchor_entry()
+            at_bottom = self.vis_hi <= self.l_abs + max(1, self._h() - 3) + 8
+        else:
+            anchor, at_bottom = None, False
+        self.reset_log_view()
+        if at_bottom:
+            ents = self.log_entries()
+            total = self._total_lines(ents, self._w(), self._with_node())
+            self.l_abs = max(0, total - max(1, self._h() - 3))
+        else:
+            pos = self._abs_of_entry(anchor) if anchor is not None else None
+            if pos is None:
+                # anchor was truncated away (or hidden): show the newest
+                ents = self.log_entries()
+                total = self._total_lines(ents, self._w(), self._with_node())
+                self.l_abs = max(0, total - max(1, self._h() - 3))
+            else:
+                self.l_abs = pos
+
+    def _after_append(self, appended):
+        """New entries appended in file order (no re-sort)."""
+        if self.mode != "log":
+            return
+        if self.needle:
+            # count-only search over the appended tail, extend matches
+            w = self._w()
+            ents = self.log_entries()
+            with_node = self._with_node()
+            nd = self.needle.casefold()
+            for e in appended:
+                if e.node != self.l_node and self.l_node != ALL_NODE:
+                    continue
+                if e.sev in self.hidden:
+                    continue
+                hit = nd in e.msg.casefold()
+                if not hit and with_node:
+                    hit = nd in e.node.casefold()
+                if not hit:
+                    hit = nd in fmt_ts(e.ts)
+                if not hit:
+                    continue
+                # appended entries live at the tail; scan a bounded window
+                # instead of the whole list (identity comparison)
+                i = None
+                tail = ents[-min(len(ents), len(appended) * 2 + 8):]
+                for j in range(len(tail) - 1, -1, -1):
+                    if tail[j] is e:
+                        i = len(ents) - len(tail) + j
+                        break
+                if i is None:
+                    continue
+                self._extend_prefix(ents, i + 1, w, with_node)
+                start = self.prefix[i]
+                n = self._lines_of(ents, i, w, with_node)
+                self.matches.extend(range(start, start + n))
+        if self.follow:
+            ents = self.log_entries()
+            total = self._total_lines(ents, self._w(), self._with_node())
+            self.l_abs = max(0, total - max(1, self._h() - 3))
+
+    def _h(self):
+        return self.stdscr.getmaxyx()[0]
 
     # ---------------------------------------------------------- handling
 
@@ -1162,6 +1303,10 @@ class App(object):
             self.mode = "log"
             self.needle = ""
             self.reset_log_view()
+            # open at the newest logs (bottom); one-time full count
+            ents = self.log_entries()
+            total = self._total_lines(ents, self._w(), self._with_node())
+            self.l_abs = max(0, total - max(1, self._h() - 3))
         elif k == ord('/'):
             self.start_input("过滤节点: ", "nodefilter", self.n_filter)
         elif k == ord('s'):

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "rosview"
-version = "1.0.3"
+version = "1.0.4"
 description = "htop/vim 风格的 ROS 日志终端查看器 (TUI log viewer for ROS)"
 readme = "README.md"
 requires-python = ">=3.6"

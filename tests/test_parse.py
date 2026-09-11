@@ -83,10 +83,10 @@ assert len(flat) == 1
 # real environment: ~/.ros/log exists with sessions and latest
 sess = rv.find_sessions()
 assert len(sess) > 0, "no sessions under %s" % rv.ROS_LOG_ROOT
-rosout = rv.resolve_rosout(os.path.expanduser("~/.ros/log/latest"))
-assert os.path.isfile(rosout)
-real = finish(rv.Session(rosout, include_node_files=False))
-assert len(real.entries) > 5
+# latest may point at a just-started run; test against the biggest session
+big = max(rv.find_sessions(), key=lambda r: r["size"])
+real = finish(rv.Session(big["path"], include_node_files=False))
+assert len(real.entries) > 100, len(real.entries)
 assert not any("[topics:" in e.msg for e in real.entries[:10])
 
 print("ALL PARSE TESTS PASSED (%d fixture entries, %d real entries)"
